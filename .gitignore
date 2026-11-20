@@ -1,0 +1,10 @@
+# Everything a run produces, and everything built for one machine. None of it belongs in git.
+.venv/
+engines/
+keys/
+results/
+images/
+archive/
+.remember/
+__pycache__/
+*.pyc

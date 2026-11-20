@@ -1,0 +1,2 @@
+# No usable NVIDIA GPU: everything runs on the CPU (slow, but works anywhere).
+onnxruntime>=1.20
