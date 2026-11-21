@@ -85,13 +85,17 @@ same packages but are untested.
 
 Measured on that machine, reading from disk, three processes sharing the GPU:
 
-| Images | Photos per second |
+| Images | Per second |
 |---|---|
-| Phone photos from a real bucket (2 MB average) | about 27 |
-| ICDAR 2015 street photos enlarged to 3840x2160 | about 30 |
+| ICDAR 2015 street photos enlarged to 3840x2160 (few text lines) | about 45 |
+| FUNSD scanned forms (about 50 text lines each) | about 21 |
 
-Downloading is often the slower part: at 25 MB/s a line delivers about 12 such photos per
-second.
+Each process decodes images in four threads, ahead of the one thread that reads them: the
+decoding runs on the CPU while the reading waits for the GPU, so the GPU is never idle
+waiting for an image.
+
+Downloading is often the slower part: at 25 MB/s a line delivers about 12 photos of 2 MB
+per second.
 
 The GPU engine (`app/gpu_engine.py`) runs the stock PP-OCRv6 models with the work around
 them moved onto the GPU: pixel normalisation is part of the detection engine, the

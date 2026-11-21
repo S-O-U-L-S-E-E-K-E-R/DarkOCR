@@ -35,7 +35,7 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ElementTree
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import requests
 
@@ -52,6 +52,7 @@ REQUEST_ATTEMPTS = 4
 GPU_MB_PER_PROCESS = {"tensorrt": 1000, "onnx": 4000}
 MAX_GPU_PROCESSES = 3  # more than 3 gave no extra speed: the processes take turns on the GPU
 CPU_PROCESSES = 4
+DECODE_THREADS = 4  # per text-reading process
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME_DIR = os.path.dirname(APP_DIR)  # the project folder: keys/, results/, images/, engines/
 ENGINE_DIR = os.path.join(HOME_DIR, "engines")
@@ -426,40 +427,141 @@ class TextReader:
         return " ".join(result.txts) if result.txts else ""
 
 
-_reader = None  # the TextReader of this worker process
+def reader_process(language, engine, tasks, results):
+    """A text-reading process: threads decode images ahead of the one thread that reads them.
 
-
-def start_worker(language, engine):
-    """Runs once in every text-reading process."""
-    global _reader
+    Decoding costs about as much time as reading, but it runs on the CPU while reading waits
+    for the GPU, so with decoding done ahead the reader never waits for an image.
+    tasks: (number, path, max_side) or None to stop. results: (number, row, error text).
+    """
+    import queue
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C is handled by the main process
-    os.makedirs(ENGINE_DIR, exist_ok=True)
-    with open(os.path.join(ENGINE_DIR, ".lock"), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # one process builds the engines, the others reuse them
-        _reader = TextReader(language, engine)
+    try:
+        os.makedirs(ENGINE_DIR, exist_ok=True)
+        with open(os.path.join(ENGINE_DIR, ".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # one process builds the engines, the others reuse them
+            reader = TextReader(language, engine)
+    except Exception as error:
+        results.put(("failed", str(error), []))
+        return
+    results.put(("ready", reader.engine_name + (" (tuned)" if reader.tuned else ""), reader.problems))
+    decoded = queue.Queue(maxsize=DECODE_THREADS)  # bounds the decoded images held in memory
+
+    def decode():
+        while True:
+            task = tasks.get()
+            if task is None:
+                decoded.put(None)
+                return
+            number, path, max_side = task
+            try:
+                decoded.put((number, read_metadata(path), load_image(path, max_side)))
+            except Exception as error:
+                results.put((number, None, f"{type(error).__name__}: {error}"))
+
+    threads = [threading.Thread(target=decode, daemon=True) for _ in range(DECODE_THREADS)]
+    for thread in threads:
+        thread.start()
+    running = len(threads)
+    while running:
+        item = decoded.get()
+        if item is None:
+            running -= 1
+            continue
+        number, row, image = item
+        try:
+            row["text"] = reader.read(image)
+            results.put((number, row, None))
+        except Exception as error:
+            results.put((number, None, f"{type(error).__name__}: {error}"))
 
 
-def worker_engine():
-    return _reader.engine_name + (" (tuned)" if _reader.tuned else ""), _reader.problems
+class Readers:
+    """The text-reading processes. submit() returns a future for one image's CSV row."""
 
+    def __init__(self, language, engine, processes):
+        self.context = multiprocessing.get_context("spawn")
+        self.tasks = self.context.Queue()
+        self.results = self.context.Queue()
+        self.waiting = {}  # task number -> future
+        self.lock = threading.Lock()
+        self.count = 0
+        self.broken = None
+        self.processes = []
+        # One process first: it builds missing engines and shows which engine really starts.
+        self.label, problems = self._start(language, engine)
+        for problem in problems:
+            print(f"Engine not usable, trying next. {problem}", file=sys.stderr)
+        self.engine = self.label.split()[0]
+        for _ in range((processes or default_processes(self.engine)) - 1):
+            self._start(language, self.engine)
+        threading.Thread(target=self._collect, daemon=True).start()
 
-def build_tuned_engine():
-    import gpu_engine
-    return gpu_engine.tune()
+    def _start(self, language, engine):
+        process = self.context.Process(target=reader_process, daemon=True,
+                                       args=(language, engine, self.tasks, self.results))
+        process.start()
+        self.processes.append(process)
+        while True:
+            try:
+                state, label, problems = self.results.get(timeout=1)
+                break
+            except Exception:  # queue.Empty
+                if not process.is_alive():
+                    raise BucketError("text engine did not start: the process stopped")
+        if state != "ready":
+            raise BucketError(f"text engine did not start: {label}")
+        return label, problems
 
+    def _collect(self):
+        """Hand each result to the future that waits for it."""
+        while True:
+            try:
+                number, row, error = self.results.get(timeout=1)
+            except Exception:  # queue.Empty
+                if self.broken is None and not all(process.is_alive() for process in self.processes):
+                    with self.lock:
+                        self.broken = "a text-reading process stopped unexpectedly"
+                        waiting, self.waiting = self.waiting, {}
+                    for future in waiting.values():
+                        future.set_exception(RuntimeError(self.broken))
+                continue
+            if number is None:
+                return
+            with self.lock:
+                future = self.waiting.pop(number, None)
+            if future is None:
+                continue
+            if error is None:
+                future.set_result(row)
+            else:
+                future.set_exception(RuntimeError(error))
 
-def analyze(local_path, max_side):
-    """Metadata and text for one downloaded image. Runs in a text-reading process."""
-    row = read_metadata(local_path)
-    row["text"] = _reader.read(load_image(local_path, max_side))
-    return row
+    def submit(self, path, max_side):
+        future = Future()
+        with self.lock:
+            if self.broken:
+                raise RuntimeError(self.broken)
+            self.count += 1
+            self.waiting[self.count] = future
+            self.tasks.put((self.count, path, max_side))
+        return future
+
+    def shutdown(self):
+        for _ in range(len(self.processes) * DECODE_THREADS):
+            self.tasks.put(None)
+        for process in self.processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+        self.results.put((None, None, None))
 
 
 def process(session, base_url, key, local_path, readers, max_side, keep):
     """Everything for one image: download, hash, then metadata and text. Runs in a thread."""
     fetch(session, base_url, key, local_path)
     row = {"image_id": key, "sha256": sha256_of(local_path), "size_bytes": os.path.getsize(local_path)}
-    row.update(readers.submit(analyze, local_path, max_side).result())
+    row.update(readers.submit(local_path, max_side).result())
     if not keep:
         os.remove(local_path)
     return row
@@ -599,7 +701,7 @@ def check_engine(language, engine):
     cv2.putText(image, "Engine check 12345", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 0), 3)
     path = os.path.join(tempfile.mkdtemp(), "check.png")
     cv2.imwrite(path, image)
-    text = readers.submit(analyze, path, 2000).result()["text"]
+    text = readers.submit(path, 2000).result()["text"]
     readers.shutdown()
     os.remove(path)
     good = "12345" in text
@@ -607,33 +709,12 @@ def check_engine(language, engine):
     return good
 
 
-def worker_ready():
-    time.sleep(1)  # long enough that every process of the pool takes one of these
-    return _reader.engine_name
-
-
 def start_readers(language, engine, processes):
     """Start the text-reading processes and report which engine they run."""
     if not os.path.exists(os.path.join(ENGINE_DIR, ".lock")) and engine in ("auto", "tensorrt"):
         print("First run: building GPU engines for this machine. This takes several minutes, once.")
-    context = multiprocessing.get_context("spawn")
-    # One process first: it builds missing engines and shows which engine really starts.
-    with ProcessPoolExecutor(1, mp_context=context, initializer=start_worker,
-                             initargs=(language, engine)) as probe:
-        try:
-            name, problems = probe.submit(worker_engine).result()
-        except Exception as error:
-            raise BucketError(f"text engine did not start: {error}") from error
-    for problem in problems:
-        print(f"Engine not usable, trying next. {problem}", file=sys.stderr)
-    label, name = name, name.split()[0]
-    if processes is None:
-        processes = default_processes(name)
-    readers = ProcessPoolExecutor(processes, mp_context=context, initializer=start_worker,
-                                  initargs=(language, name))
-    for ready in [readers.submit(worker_ready) for _ in range(processes)]:
-        ready.result()
-    print(f"Text engine: {label}, {processes} process(es)")
+    readers = Readers(language, engine, processes)
+    print(f"Text engine: {readers.label}, {len(readers.processes)} process(es)")
     return readers
 
 
@@ -689,8 +770,8 @@ def main():
         args.engine = "cpu"
     if args.tune:
         print("Building the tuned detection engine. This takes 10 to 30 minutes; the GPU should be idle.")
-        with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as pool:
-            print("Saved", pool.submit(build_tuned_engine).result())
+        import gpu_engine  # next to this file
+        print("Saved", gpu_engine.tune())
         sys.exit(0)
     if args.check:
         sys.exit(0 if check_engine(args.lang, args.engine) else 1)

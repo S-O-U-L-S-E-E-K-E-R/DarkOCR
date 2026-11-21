@@ -24,7 +24,7 @@ import numpy as np
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DIR = os.path.join(os.path.dirname(APP_DIR), "engines")
 REC_BATCH = 6        # as RapidOCR's default, so line padding and results stay the same
-CLS_BATCH = 16
+CLS_BATCH = 128     # all lines of an image in one call: its result per line does not depend on the batch
 MAX_ASPECT = 2.5     # longest side / shortest side the detection engine can take
 TUNED_LEVEL = 5      # TensorRT optimisation level of the optional tuned detection engine
 
@@ -95,8 +95,11 @@ def cls_model():
 ENGINES = {
     "det": (det_model, True, ((1, 32, 32, 3), (1, 1120, 1984, 3), (1, 2048, 2048, 3))),
     "rec": (rec_model, True, ((1, 3, 48, 32), (REC_BATCH, 3, 48, 320), (REC_BATCH, 3, 48, 4800))),
-    "cls": (cls_model, False, ((1, 3, 48, 192), (6, 3, 48, 192), (CLS_BATCH, 3, 48, 192))),
+    "cls": (cls_model, False, ((1, 3, 48, 192), (48, 3, 48, 192), (CLS_BATCH, 3, 48, 192))),
 }
+# Added to an engine's file name when its settings change, so that an updated program builds
+# the new engine instead of loading a file built for the old settings.
+REVISIONS = {"cls": "-r2"}
 
 
 # ---- building ---------------------------------------------------------------------------
@@ -113,7 +116,8 @@ def machine_tag():
 
 
 def engine_path(name, tuned=False):
-    return os.path.join(ENGINE_DIR, f"{name}{'-tuned' if tuned else ''}.{machine_tag()}.engine")
+    stem = name + REVISIONS.get(name, "") + ("-tuned" if tuned else "")
+    return os.path.join(ENGINE_DIR, f"{stem}.{machine_tag()}.engine")
 
 
 def build(name, tuned=False):
