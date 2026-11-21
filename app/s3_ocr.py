@@ -49,10 +49,9 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 REQUEST_ATTEMPTS = 4
 # GPU memory one text-reading process needs, in MB (measured on an RTX 4050, 6 GB).
-GPU_MB_PER_PROCESS = {"tensorrt": 1300, "onnx": 4000}
+GPU_MB_PER_PROCESS = {"tensorrt": 1000, "onnx": 4000}
 MAX_GPU_PROCESSES = 3  # more than 3 gave no extra speed: the processes take turns on the GPU
 CPU_PROCESSES = 4
-MAX_ASPECT = 2.5  # longest side / shortest side that the TensorRT detection engine can take
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME_DIR = os.path.dirname(APP_DIR)  # the project folder: keys/, results/, images/, engines/
 ENGINE_DIR = os.path.join(HOME_DIR, "engines")
@@ -361,13 +360,12 @@ def load_image(path, max_side):
 
 
 class TextReader:
-    """PP-OCR models through RapidOCR. One instance per process, used by one thread.
+    """PP-OCR text reading. One instance per process, used by one thread.
 
     Engines, fastest first:
-      tensorrt  detection and recognition as TensorRT FP16 engines. The small orientation
-                model stays on ONNX Runtime: as an FP16 engine it lost about 10% of the text.
-      onnx      everything on ONNX Runtime with CUDA.
-      cpu       everything on ONNX Runtime without a GPU.
+      tensorrt  gpu_engine.py: TensorRT engines with pre- and post-processing on the GPU.
+      onnx      RapidOCR on ONNX Runtime with CUDA.
+      cpu       RapidOCR on ONNX Runtime without a GPU.
     "auto" tries them in that order and uses the first that starts.
     """
 
@@ -376,16 +374,18 @@ class TextReader:
         import numpy
         cv2.setNumThreads(1)  # several processes run side by side; do not oversubscribe cores
         blank = numpy.full((128, 256, 3), 255, numpy.uint8)
-        cv2.putText(blank, "test 123", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
+        cv2.putText(blank, "test 123", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
         self.engine_name = None
         self.language = language
         self.fallback = None
+        self.tuned = False
         problems = []
         for name in (["tensorrt", "onnx", "cpu"] if engine == "auto" else [engine]):
             try:
                 self.engine = self.build(name, language)
                 self.engine(blank)  # loads all three models, proves the engine really runs
                 self.engine_name = name
+                self.tuned = getattr(self.engine, "tuned", False)
                 break
             except Exception as error:
                 problems.append(f"{name}: {str(error)[:200]}")
@@ -395,15 +395,13 @@ class TextReader:
 
     @staticmethod
     def build(name, language):
+        if name == "tensorrt":
+            import gpu_engine  # next to this file
+            return gpu_engine.GpuOCR(language)
         import onnxruntime
         from rapidocr import RapidOCR
         params = {"Global.log_level": "critical", "Rec.lang_type": language,
                   "Rec.rec_batch_num": 16, "Cls.cls_batch_num": 16}
-        if name == "tensorrt":
-            onnxruntime.preload_dlls()  # TensorRT needs the CUDA libraries of this environment
-            # Only the small orientation model runs on ONNX Runtime here, on the CPU: that
-            # keeps the GPU for the two big models and lets the processes work side by side.
-            params["EngineConfig.onnxruntime.intra_op_num_threads"] = 2
         if name == "cpu":
             params["EngineConfig.onnxruntime.intra_op_num_threads"] = 4
         if name == "onnx":
@@ -414,30 +412,9 @@ class TextReader:
                            cuda + "arena_extend_strategy": "kSameAsRequested"})
             if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
                 raise RuntimeError("ONNX Runtime has no CUDA support")
-        if name == "tensorrt":
-            from rapidocr.utils.typings import EngineType
-            os.makedirs(ENGINE_DIR, exist_ok=True)
-            params.update({"Det.engine_type": EngineType.TENSORRT,
-                           "Rec.engine_type": EngineType.TENSORRT,
-                           "Rec.rec_batch_num": 6,  # the engine is built for batches up to 6
-                           # ... and for text lines up to 100 times wider than tall
-                           "EngineConfig.tensorrt.rec_profile.max_shape": [6, 3, 48, 4800],
-                           "EngineConfig.tensorrt.cache_dir": ENGINE_DIR})
         return RapidOCR(params=params)
 
     def read(self, image):
-        if self.engine_name == "tensorrt":
-            # The detection engine accepts inputs up to 2048 pixels per side and returns
-            # nothing, silently, beyond that. A long thin image would be scaled past the
-            # limit, so give it a white margin that keeps its shape within range.
-            import cv2
-            height, width = image.shape[:2]
-            short_side = int(max(height, width) / MAX_ASPECT) + 1
-            if min(height, width) < short_side:
-                extra = short_side - min(height, width)
-                image = cv2.copyMakeBorder(image, 0, extra if height < width else 0,
-                                           0, extra if width < height else 0,
-                                           cv2.BORDER_CONSTANT, value=(255, 255, 255))
         try:
             result = self.engine(image)
         except Exception:
@@ -463,7 +440,12 @@ def start_worker(language, engine):
 
 
 def worker_engine():
-    return _reader.engine_name, _reader.problems
+    return _reader.engine_name + (" (tuned)" if _reader.tuned else ""), _reader.problems
+
+
+def build_tuned_engine():
+    import gpu_engine
+    return gpu_engine.tune()
 
 
 def analyze(local_path, max_side):
@@ -644,13 +626,14 @@ def start_readers(language, engine, processes):
             raise BucketError(f"text engine did not start: {error}") from error
     for problem in problems:
         print(f"Engine not usable, trying next. {problem}", file=sys.stderr)
+    label, name = name, name.split()[0]
     if processes is None:
         processes = default_processes(name)
     readers = ProcessPoolExecutor(processes, mp_context=context, initializer=start_worker,
                                   initargs=(language, name))
     for ready in [readers.submit(worker_ready) for _ in range(processes)]:
         ready.result()
-    print(f"Text engine: {name}, {processes} process(es)")
+    print(f"Text engine: {label}, {processes} process(es)")
     return readers
 
 
@@ -687,6 +670,9 @@ def main():
                              "at most 3; on the CPU at most 4)")
     parser.add_argument("--check", action="store_true",
                         help="start the text engine, read a test image, and stop")
+    parser.add_argument("--tune", action="store_true",
+                        help="build a faster detection engine for this GPU (10 to 30 minutes, once), "
+                             "then stop; later runs use it automatically")
     parser.add_argument("--engine", choices=["auto", "tensorrt", "onnx", "cpu"], default="auto",
                         help="auto = fastest engine that starts (TensorRT, then ONNX+CUDA, then CPU)")
     parser.add_argument("--max-side", type=int, default=2000,
@@ -701,6 +687,11 @@ def main():
     args = parser.parse_args()
     if args.cpu or (args.engine == "auto" and installed_mode() == "cpu"):
         args.engine = "cpu"
+    if args.tune:
+        print("Building the tuned detection engine. This takes 10 to 30 minutes; the GPU should be idle.")
+        with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as pool:
+            print("Saved", pool.submit(build_tuned_engine).result())
+        sys.exit(0)
     if args.check:
         sys.exit(0 if check_engine(args.lang, args.engine) else 1)
 

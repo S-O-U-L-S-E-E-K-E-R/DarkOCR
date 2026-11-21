@@ -1,6 +1,7 @@
 # NVIDIA GPU, driver 550 or newer. This exact set is tested together (CUDA 12.4 runtime).
 # The CUDA libraries come from these packages; no system-wide CUDA install is needed.
 onnxruntime-gpu==1.22.0
+onnx>=1.16   # edits the model files before the GPU engines are built
 tensorrt-cu12==10.9.0.34
 cuda-bindings==12.9.10
 nvidia-cudnn-cu12==9.1.0.70

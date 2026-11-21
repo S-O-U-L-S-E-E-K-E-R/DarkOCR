@@ -63,7 +63,7 @@ others get the same result with `duplicate_of` filled in. `--no-dedupe` turns th
 
 | Machine | Setup | Text engine |
 |---|---|---|
-| NVIDIA GPU, driver 550+ | GPU | TensorRT FP16, built for that GPU on first start (several minutes, once) |
+| NVIDIA GPU, driver 550+ | GPU | TensorRT engines, built for that GPU on first start (about 10 minutes, once) |
 | NVIDIA GPU, older driver | CPU, with a note to update the driver | ONNX Runtime on the CPU |
 | No NVIDIA GPU | CPU | ONNX Runtime on the CPU |
 
@@ -72,8 +72,34 @@ CUDA, then CPU) and uses the first one that starts, so a GPU that TensorRT canno
 still works, only slower. The number of parallel text-reading processes is chosen from
 the free GPU memory.
 
-Tested on one machine only: RTX 4050 Laptop (6 GB), driver 550, where it reads about
-12 photos per second. Other NVIDIA GPUs use the same packages but are untested.
+Tested on one machine only: RTX 4050 Laptop (6 GB), driver 550. Other NVIDIA GPUs use the
+same packages but are untested.
+
+### Speed
+
+Measured on that machine, reading from disk, three processes sharing the GPU:
+
+| Images | Photos per second |
+|---|---|
+| Phone photos from a real bucket (2 MB average) | about 27 |
+| ICDAR 2015 street photos enlarged to 3840x2160 | about 30 |
+
+Downloading is often the slower part: at 25 MB/s a line delivers about 12 such photos per
+second.
+
+The GPU engine (`app/gpu_engine.py`) runs the stock PP-OCRv6 models with the work around
+them moved onto the GPU: pixel normalisation is part of the detection engine, the
+recognition engine returns the chosen characters instead of the full score table, and the
+orientation model runs in full precision. That is about twice as fast as running the same
+models through RapidOCR's own TensorRT support, with the same text: on 300 real photos both
+found 9,510 words and agreed on 98.7% of them (the rest is rounding noise in both directions).
+
+`./run.sh --tune` builds a second detection engine with TensorRT's slowest, most thorough
+kernel search. It takes 10 to 30 minutes with an idle GPU, is done once, and is used
+automatically afterwards. It made detection about 30% faster here.
+
+The GPU engine covers the default text model (`ch`: Chinese + English). Other `--lang`
+models run on the ONNX Runtime engine, which is slower.
 
 Force a setup with `./setup.sh --gpu` or `./setup.sh --cpu`. Test an install with
 `./run.sh --check`.
@@ -92,6 +118,7 @@ Force a setup with `./setup.sh --gpu` or `./setup.sh --cpu`. Test an install wit
 | `--lang NAME` | Text model: `ch` (Chinese + English, default), `en`, `japan`, `korean`, `latin`, `cyrillic`, `arabic`, ... |
 | `--max-side N` | Shrink bigger images to N pixels before reading (default 2000, 0 = full size) |
 | `--engine NAME` | `auto` (default), `tensorrt`, `onnx`, `cpu` |
+| `--tune` | Build the faster detection engine for this GPU, then stop |
 | `--workers N` | Parallel downloads (default 32) |
 
 `./map.sh results/<bucket>.csv` rebuilds a map from an existing CSV.
@@ -113,7 +140,7 @@ Force a setup with `./setup.sh --gpu` or `./setup.sh --cpu`. Test an install wit
 run.sh          start (installs on first start)
 setup.sh        install or reinstall .venv for this machine
 map.sh          rebuild a GPS map from a results CSV
-app/            the program: s3_ocr.py, gps_map.py, vendor/ (Leaflet 1.9.4)
+app/            the program: s3_ocr.py, gpu_engine.py, gps_map.py, vendor/ (Leaflet 1.9.4)
 requirements/   package lists: base, gpu-cuda12, cpu
 ```
 

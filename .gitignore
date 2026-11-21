@@ -8,3 +8,7 @@ archive/
 .remember/
 __pycache__/
 *.pyc
+V2/data/
+V2/runs/
+V2/engines/
+V2/
