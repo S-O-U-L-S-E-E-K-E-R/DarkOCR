@@ -14,8 +14,14 @@ data the images contain. Store and share it accordingly.
 ## Start
 
 ```bash
+git clone https://github.com/S-O-U-L-S-E-E-K-E-R/DarkOCR.git
+cd DarkOCR
 ./run.sh
 ```
+
+To update an existing copy: `git pull`, then `./run.sh`. New packages are installed
+automatically, and GPU engines are rebuilt when a new version needs them (about 10 minutes,
+once). `./run.sh --tune` afterwards makes text detection about 30% faster.
 
 The first start on a machine runs `setup.sh`, which creates `.venv` and installs the right
 packages for that machine. Then it asks four things; press Enter to accept a default.

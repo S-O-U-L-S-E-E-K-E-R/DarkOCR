@@ -64,6 +64,7 @@ else
     pip install -q -r requirements/base.txt -r requirements/cpu.txt
 fi
 echo "$mode" > .venv/install-mode
+cat requirements/*.txt | sha256sum | cut -d' ' -f1 > .venv/requirements.sum
 
 say "Checking the text engine (a new GPU builds its engines now: several minutes, once)"
 if .venv/bin/python app/s3_ocr.py --check; then
